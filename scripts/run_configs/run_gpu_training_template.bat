@@ -2,13 +2,11 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM HTC training from one YAML path
-
-REM Full path to scenario YAML file.
+REM Supervisor edits ONLY this line.
 set "YAML_PATH=D:\HTC_github\scenario_3_ManUSPECTRAL\config\manifold_settings.yaml"
 
 REM DO NOT EDIT BELOW
 
-REM Resolve YAML path and derive folders robustly.
 for /f "delims=" %%i in ('powershell -NoProfile -Command "(Resolve-Path '%YAML_PATH%').Path"') do set "YAML_PATH_ABS=%%i"
 for /f "delims=" %%i in ('powershell -NoProfile -Command "Split-Path -Parent (Split-Path -Parent '%YAML_PATH_ABS%')"') do set "SCENARIO_DIR=%%i"
 for /f "delims=" %%i in ('powershell -NoProfile -Command "Split-Path -Parent '%SCENARIO_DIR%'"') do set "PROJECT_ROOT=%%i"
@@ -34,8 +32,20 @@ copy "%~f0" "%RUN_CONFIG_DIR%\%~n0_used_%TS%.bat" >nul
 cd /d "%PROJECT_ROOT%\htc"
 call HSI_ML\Scripts\activate.bat
 
-REM Read training_profile from YAML without requiring PyYAML in the batch file.
-for /f "delims=" %%i in ('powershell -NoProfile -Command "$y=Get-Content -Raw '%YAML_PATH_ABS%'; if($y -match '(?m)^\s*training_profile\s*:\s*[''\"'']?([^''\"''\r\n#]+)') {$matches[1].Trim()} else {'gpu_smoke'}"') do set "TRAINING_PROFILE=%%i"
+REM Read training_profile from YAML using findstr.
+set "TRAINING_PROFILE="
+
+for /f "tokens=2 delims=:" %%i in ('findstr /R /C:"^[ ]*training_profile[ ]*:" "%YAML_PATH_ABS%"') do set "TRAINING_PROFILE=%%i"
+
+set "TRAINING_PROFILE=%TRAINING_PROFILE: =%"
+
+if not defined TRAINING_PROFILE (
+  echo ERROR: training_profile not found in YAML.
+  echo Expected line like:
+  echo   training_profile: gpu_practical
+  pause
+  exit /b 3
+)
 
 echo YAML_PATH=%YAML_PATH_ABS%
 echo PROJECT_ROOT=%PROJECT_ROOT%
@@ -54,7 +64,7 @@ python "%PROJECT_ROOT%\htc\scripts\newer_scripts\htc_median_pixel_from_yaml_offi
   --build-htc-adapter ^
   --adapter-dataset-name "Cat_HTC_Adapter" ^
   --annotation-name "semantic#primary" ^
-  --training-profile gpu_smoke ^
+  --training-profile %TRAINING_PROFILE% ^
   --accelerator gpu ^
   --devices 1 ^
   --precision 32-true ^
@@ -72,11 +82,14 @@ set "TRAIN_EXIT=%ERRORLEVEL%"
 echo Training exit code: %TRAIN_EXIT%
 
 if "%TRAIN_EXIT%"=="0" (
-  for /f "delims=" %%i in ('powershell -NoProfile -Command "Get-ChildItem '%PATH_HTC_RESULTS%\training\median_pixel' -Recurse -Filter 'test_predictions.csv' | Where-Object { $_.FullName -like '*%TRAINING_PROFILE%*' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | ForEach-Object { $_.Directory.Parent.FullName }"') do set "RUN_DIR=%%i"
+  set "RUN_DIR="
+  for /f "delims=" %%i in ('powershell -NoProfile -Command "$p=Get-ChildItem '%PATH_HTC_RESULTS%\training\median_pixel' -Recurse -Filter 'test_predictions.csv' | Where-Object { $_.FullName -like '*%TRAINING_PROFILE%*' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if($p){$p.Directory.Parent.FullName}"') do set "RUN_DIR=%%i"
+
   if defined RUN_DIR (
     echo %RUN_DIR%> "%RUN_CONFIG_DIR%\last_run_dir.txt"
     echo %RUN_DIR%> "%RUN_CONFIG_DIR%\last_run_dir_%TRAINING_PROFILE%.txt"
-    echo Saved run folder: %RUN_DIR%
+    echo Saved run folder:
+    echo %RUN_DIR%
   ) else (
     echo WARNING: Training succeeded but no test_predictions.csv was found for %TRAINING_PROFILE%.
   )
