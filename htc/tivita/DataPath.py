@@ -1,3 +1,5 @@
+import pandas as pd
+pd.set_option("mode.string_storage", "python")
 # SPDX-FileCopyrightText: 2022 Division of Intelligent Medical Systems, DKFZ
 # SPDX-License-Identifier: MIT
 
@@ -1544,3 +1546,23 @@ def filter_annotation_name(path: DataPath) -> bool:
     annotation_name_requested = set(annotation_name_requested)
 
     return len(set(path.meta("annotation_name")).intersection(annotation_name_requested)) > 0
+
+
+# --- Cat HTC Adapter from_image_name patch ---
+try:
+    import os
+
+    _original_from_image_name = DataPath.from_image_name
+
+    def _adapter_aware_from_image_name(image_name, *args, **kwargs):
+        if os.environ.get("PATH_Tivita_Cat_HTC_Adapter"):
+            from htc.tivita.DataPathAdapter import DataPathAdapter
+            return DataPathAdapter.from_image_name(image_name)
+
+        return _original_from_image_name(image_name, *args, **kwargs)
+
+    DataPath.from_image_name = staticmethod(_adapter_aware_from_image_name)
+
+except Exception as e:
+    print(f"[WARNING][htc] Could not install adapter-aware DataPath.from_image_name patch: {e}")
+# --- End Cat HTC Adapter from_image_name patch ---

@@ -1,0 +1,105 @@
+from pathlib import Path
+import re
+
+path = Path(r"D:\HTC_github\htc\htc\tivita\DataPathAdapter.py")
+
+code = r'''from pathlib import Path
+import json
+import os
+
+import pandas as pd
+
+try:
+    pd.set_option("mode.string_storage", "python")
+except Exception:
+    pass
+
+from htc.tivita.DataPathTivita import DataPathTivita
+from htc.tivita.DatasetSettings import DatasetSettings
+
+
+class DataPathAdapter(DataPathTivita):
+    _path_to_image_name_cache = {}
+    _image_name_to_row_cache = None
+
+    @staticmethod
+    def _norm_path(path) -> str:
+        return str(Path(path)).replace("/", "\\").rstrip("\\").lower()
+
+    @classmethod
+    def _adapter_root(cls) -> Path:
+        value = os.environ.get("PATH_Tivita_Cat_HTC_Adapter")
+        if value is None:
+            raise RuntimeError("PATH_Tivita_Cat_HTC_Adapter is not set")
+        return Path(value)
+
+    @classmethod
+    def _load_image_name_cache(cls):
+        if cls._image_name_to_row_cache is not None:
+            return cls._image_name_to_row_cache
+
+        adapter_root = cls._adapter_root()
+        tables_dir = adapter_root / "intermediates" / "tables"
+
+        meta_files = sorted(tables_dir.glob("*@meta.feather"))
+        if *ot meta_files:
+            raise F*leNotFoundError(f"No *@meta.feathe* file found in {tables_dir}")
+
+   *    df = pd.read_feather(meta_file*[0]).reset_index(drop=True)
+
+     *  cache = {}
+        for _, row in*df.iterrows():
+            cache[str(row["image_name"])] = {
+        *       "path": str(row["path"]),
+ *              "data_dir": str(row["data_dir"]),
+            }
+
+      * cls._image_name_to_row_cache = ca*he
+        return cache
+
+    @clas*method
+    def from_image_name(cls* image_name: str):
+        # Strip*annotation suffix, e.g. image@sema*tic#primary -> image
+        base_*mage_name = str(image_name).split(*@")[0]
+
+        cache = cls._load_*mage_name_cache()
+        if base_*mage_name not in cache:
+          * raise AssertionError(
+           *    f"Could not find {base_image_n*me} in adapter meta table "
+      *         f"(n={len(cache)})"
+     *      )
+
+        adapter_root = cl*._adapter_root()
+        row = cac*e[base_image_name]
+
+        settin*s_path = adapter_root / "data" / "*ataset_settings.json"
+        sett*ngs = DatasetSettings(json.loads(s*ttings_path.read_text(encoding="ut*-8")))
+
+        return cls(
+      *     Path(row["path"]),
+          * Path(row["data_dir"]),
+          * adapter_root / "intermediates",
+            settings,
+        )
+
+    @classmethod
+    def _load_meta_cache(cls, intermediates_dir: Path) -> None:
+        cache = cls._load_image_name_cache()
+        for image_name, row in cache.items():
+            cls._path_to_image_name_cache[cls._norm_path(row["path"])] = image_name
+
+    def image_name(self) -> str:
+        self._load_meta_cache(self.intermediates_dir)
+        key = self._norm_path(self.image_dir)
+        if key in self._path_to_image_name_cache:
+            return self._path_to_image_name_cache[key]
+        return super().image_name()
+'''
+
+backup = path.with_suffix(path.suffix + ".bak_from_image_name")
+if path.exists() and not backup.exists():
+    backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"Backup written: {backup}")
+
+path.write_text(code, encoding="utf-8")
+print(f"Patched {path}")

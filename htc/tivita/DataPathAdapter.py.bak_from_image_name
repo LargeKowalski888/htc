@@ -1,0 +1,28 @@
+from pathlib import Path
+import pandas as pd
+from htc.tivita.DataPathTivita import DataPathTivita
+class DataPathAdapter(DataPathTivita):
+    _path_to_image_name_cache = {}
+    _loaded_intermediates = set()
+    @staticmethod
+    def _norm_path(path) -> str:
+        return str(Path(path)).replace("/", "\\").rstrip("\\").lower()
+    @classmethod
+    def _load_meta_cache(cls, intermediates_dir: Path) -> None:
+        intermediates_dir = Path(intermediates_dir)
+        cache_key = cls._norm_path(intermediates_dir)
+        if cache_key in cls._loaded_intermediates:
+            return
+        for meta_path in (intermediates_dir / "tables").glob("*@meta.feather"):
+            df = pd.read_feather(meta_path)
+            if "image_name" not in df.columns or "path" not in df.columns:
+                continue
+            for _, row in df.iterrows():
+                cls._path_to_image_name_cache[cls._norm_path(row["path"])] = row["image_name"]
+        cls._loaded_intermediates.add(cache_key)
+    def image_name(self) -> str:
+        self._load_meta_cache(self.intermediates_dir)
+        key = self._norm_path(self.image_dir)
+        if key in self._path_to_image_name_cache:
+            return self._path_to_image_name_cache[key]
+        return super().image_name()
