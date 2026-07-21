@@ -202,9 +202,21 @@ def get_label_for_key(
 
 
 def value_for_key(value: Any, key: str, default: str) -> str:
+    """Return a YAML value for one class key and clean path-fragment values.
+
+    This is used for per-class labelling_file and hyperguis entries. We strip
+    leading slashes/backslashes so YAML values like "\\_hypergui_6" behave like
+    folder names instead of rooted paths on Windows.
+    """
     if isinstance(value, dict):
-        return str(value.get(key, default))
-    return str(value if value is not None else default)
+        raw = value.get(key, default)
+    else:
+        raw = value if value is not None else default
+
+    cleaned = str(raw).strip().strip('"').strip("'")
+    cleaned = cleaned.replace("/", "\\")
+    cleaned = cleaned.lstrip("\\/")
+    return cleaned
 
 
 def label_file_matches(
@@ -212,17 +224,38 @@ def label_file_matches(
     pattern: str,
     require_standardized_or_001: bool,
 ) -> Path | None:
-    """
-    Accept any file beginning with '_labelling'.
+    """Find the class-specific labelling file for one sample directory.
 
-    Examples:
-        _labelling_001.txt
-        _labelling_standardized.txt
-        _labelling_paper_tissue_atlas_uro_patient.txt
+    If the YAML provides labelling_file for a class, use that exact file or glob
+    pattern first. Only fall back to the old _labelling_001/standardized logic
+    when no class-specific match is found.
     """
+    pattern = str(pattern or "").strip().strip('"').strip("'").replace("/", "\\").lstrip("\\/")
 
+    candidates: list[Path] = []
+
+    if pattern:
+        # Exact file name, e.g. _labelling_paper_tissue_atlas_uro_patient.txt
+        exact = sample_dir / pattern
+        if exact.exists():
+            candidates.append(exact)
+
+        # Glob pattern, e.g. _labelling_paper_*.txt
+        candidates.extend(sorted(sample_dir.glob(pattern)))
+
+    if candidates:
+        return candidates[0]
+
+    if require_standardized_or_001:
+        strict_patterns = ["_labelling_001.txt", "*_labelling_standardized.txt", "_labelling_standardized.txt"]
+        for p in strict_patterns:
+            matches = sorted(sample_dir.glob(p))
+            if matches:
+                return matches[0]
+        return None
+
+    # Flexible fallback for legacy YAML files.
     matches = sorted(sample_dir.glob("_labelling*"))
-
     if matches:
         return matches[0]
 
@@ -264,7 +297,7 @@ def scan_yaml_dataset(cfg: dict[str, Any], args: argparse.Namespace) -> pd.DataF
                     count += 1
             if count:
                 status = "ok"
-        audit_rows.append({"organ_key": organ_key, "class_folder_path": str(class_folder), "label_name": label_name, "status": status, "count": count})
+        audit_rows.append({"organ_key": organ_key, "class_folder_path": str(class_folder), "label_name": label_name, "labelling_file": label_pattern, "hypergui": hypergui_name, "status": status, "count": count})
     df = pd.DataFrame([asdict(r) for r in rows])
     if df.empty:
         raise ValueError("No valid samples found")
@@ -288,96 +321,177 @@ def make_label_mapping(labels: list[str]) -> dict[str, int]:
     return {label: idx for idx, label in enumerate(labels)}
 
 def split_by_subject(df: pd.DataFrame, image_col: str) -> list[dict[str, Any]]:
-    """Create a subject-separated but organ-aware train/val/test split.
+    """Create train/val/test splits with YAML control.
 
-    The old split used sorted subjects and could leave some organs absent from
-    the test set. This split greedily selects validation and test subjects so
-    that every label present in the full manifest is represented in test and,
-    when possible, validation too.
+    This version supports manual splits and a randomized balanced subject search.
+    The automatic mode searches many subject-separated candidate splits and
+    chooses the one with the best class support across train/val/test.
+
+    YAML example:
+      splits:
+        mode: auto
+        train_fraction: 0.60
+        val_fraction: 0.20
+        test_fraction: 0.20
+        min_train_per_class: 25
+        min_val_per_class: 5
+        min_test_per_class: 10
+        split_seed: 1337
+        split_trials: 5000
     """
-    subjects = sorted(df["subject_name"].dropna().astype(str).unique().tolist())
-    all_labels = set(df["label_name"].dropna().astype(str).unique().tolist())
+    split_cfg = globals().get("YAML_SPLITS_CONFIG", {}) or {}
+    if not isinstance(split_cfg, dict):
+        split_cfg = {}
 
-    if not subjects:
+    subjects_all = sorted(df["subject_name"].dropna().astype(str).unique().tolist())
+    labels_all = sorted(df["label_name"].dropna().astype(str).unique().tolist())
+    if not subjects_all:
         raise ValueError("No subjects available for train/val/test split")
 
-    n_subjects = len(subjects)
-    n_test_target = max(1, round(n_subjects * 0.2))
-    n_val_target = max(1, round(n_subjects * 0.2))
-
-    subject_to_labels = {
-        s: set(df.loc[df["subject_name"].astype(str).eq(s), "label_name"].dropna().astype(str).unique().tolist())
-        for s in subjects
-    }
-    subject_to_rows = {
-        s: int(df.loc[df["subject_name"].astype(str).eq(s)].shape[0])
-        for s in subjects
-    }
-
-    def greedy_subjects(available: list[str], target_n: int, required_labels: set[str]) -> list[str]:
-        selected: list[str] = []
-        uncovered = set(required_labels)
-        remaining = list(available)
-
-        while remaining and (uncovered or len(selected) < target_n):
-            def score(s: str):
-                labels = subject_to_labels.get(s, set())
-                return (
-                    len(labels & uncovered),
-                    len(labels),
-                    subject_to_rows.get(s, 0),
-                    s,
-                )
-
-            best = max(remaining, key=score)
-            selected.append(best)
-            remaining.remove(best)
-            uncovered -= subject_to_labels.get(best, set())
-
-            if len(remaining) <= 1 and len(selected) >= target_n:
-                break
-
-        return selected
-
-    # Choose test first because confusion-matrix support is the key evaluation requirement.
-    test_subjects = greedy_subjects(subjects, n_test_target, all_labels)
-    remaining_after_test = [s for s in subjects if s not in set(test_subjects)]
-
-    # Choose validation from remaining subjects.
-    val_subjects = greedy_subjects(remaining_after_test, n_val_target, all_labels)
-    train_subjects = [s for s in subjects if s not in set(test_subjects) and s not in set(val_subjects)]
-
-    if not train_subjects:
-        raise ValueError("Balanced split left no training subjects. Add more subjects or define split manually.")
+    def as_list(value) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return [str(x) for x in value]
 
     def names_for(subs: list[str]) -> list[str]:
         return sorted(df[df["subject_name"].astype(str).isin(subs)][image_col].drop_duplicates().tolist())
 
-    def labels_for(subs: list[str]) -> set[str]:
-        return set(df[df["subject_name"].astype(str).isin(subs)]["label_name"].dropna().astype(str).unique().tolist())
-
-    split_subjects = {
-        "train": train_subjects,
-        "val": val_subjects,
-        "test": test_subjects,
-    }
-
-    print("[INFO] Organ-aware subject split:")
-    for split_name, subs in split_subjects.items():
-        split_labels = labels_for(subs)
-        missing = sorted(all_labels - split_labels)
-        label_counts = df[df["subject_name"].astype(str).isin(subs)]["label_name"].value_counts().sort_index()
-        print(f"[INFO] {split_name}: n_subjects={len(subs)}, n_images={len(names_for(subs))}, n_labels={len(split_labels)}")
-        print(label_counts.to_string())
+    def report(split_name: str, subs: list[str], min_required: int | None = None) -> None:
+        d = df[df["subject_name"].astype(str).isin(subs)]
+        counts = d["label_name"].astype(str).value_counts().sort_index()
+        print(f"[INFO] {split_name}: n_subjects={len(subs)}, n_images={len(names_for(subs))}, n_labels={counts.shape[0]}")
+        print(counts.to_string() if len(counts) else "<empty>")
+        missing = sorted(set(labels_all) - set(counts.index.astype(str)))
         if missing:
             print(f"[WARNING] {split_name} split is missing labels: {missing}")
+        if min_required is not None:
+            low = {label: int(counts.get(label, 0)) for label in labels_all if int(counts.get(label, 0)) < min_required}
+            if low:
+                print(f"[WARNING] {split_name} split has labels below minimum {min_required}: {low}")
 
-    test_missing = sorted(all_labels - labels_for(test_subjects))
-    if test_missing:
-        raise ValueError(
-            "Test split is missing labels and confusion matrix would be incomplete: "
-            + ", ".join(test_missing)
+    manual_keys = {"train_subjects", "val_subjects", "test_subjects"}
+    if str(split_cfg.get("mode", "")).lower() == "manual" or any(k in split_cfg for k in manual_keys):
+        train_subjects = as_list(split_cfg.get("train_subjects", split_cfg.get("train", [])))
+        val_subjects = as_list(split_cfg.get("val_subjects", split_cfg.get("val", [])))
+        test_subjects = as_list(split_cfg.get("test_subjects", split_cfg.get("test", [])))
+
+        if not train_subjects or not val_subjects or not test_subjects:
+            raise ValueError("Manual YAML split requires train_subjects, val_subjects, and test_subjects")
+
+        known = set(subjects_all)
+        unknown = sorted(set(train_subjects + val_subjects + test_subjects) - known)
+        if unknown:
+            raise ValueError(f"Manual YAML split contains unknown subjects: {unknown}")
+
+        overlap = (set(train_subjects) & set(val_subjects)) | (set(train_subjects) & set(test_subjects)) | (set(val_subjects) & set(test_subjects))
+        if overlap:
+            raise ValueError(f"Manual YAML split contains subjects in multiple splits: {sorted(overlap)}")
+
+        print("[INFO] Using manual train/val/test subject split from YAML")
+        report("train", train_subjects, int(split_cfg.get("min_train_per_class", 0) or 0) or None)
+        report("val", val_subjects, int(split_cfg.get("min_val_per_class", 0) or 0) or None)
+        report("test", test_subjects, int(split_cfg.get("min_test_per_class", 0) or 0) or None)
+        return [{
+            "fold_name": "fold_yaml",
+            "train": {"image_names": names_for(train_subjects)},
+            "val": {"image_names": names_for(val_subjects)},
+            "test": {"image_names": names_for(test_subjects)},
+        }]
+
+    import random
+
+    min_train = int(split_cfg.get("min_train_per_class", 25) or 25)
+    min_val = int(split_cfg.get("min_val_per_class", 5) or 5)
+    min_test = int(split_cfg.get("min_test_per_class", 10) or 10)
+    train_fraction = float(split_cfg.get("train_fraction", 0.60))
+    val_fraction = float(split_cfg.get("val_fraction", 0.20))
+    test_fraction = float(split_cfg.get("test_fraction", 0.20))
+    seed = int(split_cfg.get("split_seed", 1337) or 1337)
+    trials = int(split_cfg.get("split_trials", 5000) or 5000)
+
+    n_subjects = len(subjects_all)
+    n_test = max(1, round(n_subjects * test_fraction))
+    n_val = max(1, round(n_subjects * val_fraction))
+    if n_test + n_val >= n_subjects:
+        raise ValueError("val_fraction + test_fraction leaves no training subjects")
+
+    subject_counts = {
+        s: df[df["subject_name"].astype(str).eq(s)]["label_name"].astype(str).value_counts().to_dict()
+        for s in subjects_all
+    }
+    total_counts = df["label_name"].astype(str).value_counts().to_dict()
+
+    def counts_for(subs: list[str]) -> dict[str, int]:
+        counts = {label: 0 for label in labels_all}
+        for s in subs:
+            for label, n in subject_counts.get(s, {}).items():
+                counts[label] = counts.get(label, 0) + int(n)
+        return counts
+
+    def split_score(train_subs: list[str], val_subs: list[str], test_subs: list[str]) -> tuple:
+        train_counts = counts_for(train_subs)
+        val_counts = counts_for(val_subs)
+        test_counts = counts_for(test_subs)
+
+        # Heavy penalties for missing classes, then below-minimum support.
+        missing_train = sum(1 for l in labels_all if train_counts.get(l, 0) == 0)
+        missing_val = sum(1 for l in labels_all if val_counts.get(l, 0) == 0)
+        missing_test = sum(1 for l in labels_all if test_counts.get(l, 0) == 0)
+
+        train_def = sum(max(0, min(min_train, int(total_counts.get(l, 0))) - int(train_counts.get(l, 0))) for l in labels_all)
+        val_def = sum(max(0, min(min_val, int(total_counts.get(l, 0))) - int(val_counts.get(l, 0))) for l in labels_all)
+        test_def = sum(max(0, min(min_test, int(total_counts.get(l, 0))) - int(test_counts.get(l, 0))) for l in labels_all)
+
+        # Prefer approximate subject fractions as secondary criterion.
+        desired_train = n_subjects - n_val - n_test
+        subject_imbalance = abs(len(train_subs) - desired_train) + abs(len(val_subs) - n_val) + abs(len(test_subs) - n_test)
+
+        # Prefer more samples in training after hard constraints.
+        train_rows = sum(sum(subject_counts.get(s, {}).values()) for s in train_subs)
+
+        # Python tuple is minimized. Negative train_rows means more training rows is better.
+        return (
+            missing_test * 100000 + missing_val * 50000 + missing_train * 50000,
+            test_def * 1000 + val_def * 500 + train_def * 500,
+            subject_imbalance,
+            -train_rows,
         )
+
+    rng = random.Random(seed)
+    best = None
+    best_score = None
+
+    # Deterministic-ish candidate: shuffled candidates plus a sorted baseline.
+    candidates: list[list[str]] = [subjects_all[:]]
+    for _ in range(trials):
+        shuffled = subjects_all[:]
+        rng.shuffle(shuffled)
+        candidates.append(shuffled)
+
+    for shuffled in candidates:
+        test_subs = sorted(shuffled[:n_test])
+        val_subs = sorted(shuffled[n_test:n_test + n_val])
+        train_subs = sorted(shuffled[n_test + n_val:])
+        score = split_score(train_subs, val_subs, test_subs)
+        if best_score is None or score < best_score:
+            best_score = score
+            best = (train_subs, val_subs, test_subs)
+
+    if best is None:
+        raise ValueError("Could not find any candidate split")
+
+    train_subjects, val_subjects, test_subjects = best
+
+    print("[INFO] Using randomized balanced subject split search")
+    print(f"[INFO] Fractions by subject: train~{train_fraction}, val={val_fraction}, test={test_fraction}")
+    print(f"[INFO] Subject counts: train={len(train_subjects)}, val={len(val_subjects)}, test={len(test_subjects)}")
+    print(f"[INFO] Minimum support targets: train={min_train}, val={min_val}, test={min_test}")
+    print(f"[INFO] Split search seed={seed}, trials={trials}, score={best_score}")
+    report("train", train_subjects, min_train)
+    report("val", val_subjects, min_val)
+    report("test", test_subjects, min_test)
 
     return [{
         "fold_name": "fold_yaml",
@@ -385,6 +499,7 @@ def split_by_subject(df: pd.DataFrame, image_col: str) -> list[dict[str, Any]]:
         "val": {"image_names": names_for(val_subjects)},
         "test": {"image_names": names_for(test_subjects)},
     }]
+
 
 def read_reflectance_spectrum(xlsx_path: str, wavelength_min: float = 500.0, wavelength_max: float = 995.0) -> np.ndarray:
     """Read CSV1 spectrum and keep only the requested inclusive wavelength range."""
@@ -893,6 +1008,7 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = load_yaml(Path(args.settings_yaml))
+    globals()["YAML_SPLITS_CONFIG"] = cfg.get("splits", cfg.get("split_subjects", {})) or {}
     df = scan_yaml_dataset(cfg, args)
     labels = ordered_labels(df, cfg, args.label_mode)
     label_mapping = make_label_mapping(labels)
