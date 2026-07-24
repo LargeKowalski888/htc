@@ -252,71 +252,32 @@ def write_clean_excel_report(
             sh.conditional_formatting.add(rng, ColorScaleRule(start_type="min", start_color="FFFFFF", end_type="max", end_color="63BE7B"))
 
     def write_grouped_details_sheet(wb: Workbook, sheet_name: str, d: pd.DataFrame) -> None:
-        """Write one split sheet for one class, grouped by individual.
-
-        Layout goal:
-          - show the number of unique individuals and unique recordings at the top
-          - list each individual once
-          - list that individual's recordings underneath
-          - keep long paths available but visually separated to the right
-        """
         sh = wb.create_sheet(sheet_name)
-
-        # Title band
         sh["A1"] = sheet_name
         sh["A1"].font = Font(bold=True, size=14, color="FFFFFF")
         sh["A1"].fill = fill_title
         sh.merge_cells("A1:F1")
-
-        n_individuals = int(d["individual"].nunique()) if d is not None and not d.empty and "individual" in d.columns else 0
-        n_recordings = int(d["recording"].nunique()) if d is not None and not d.empty and "recording" in d.columns else 0
-
-        # Summary cards
-        sh["A3"] = "Unique individuals"
-        sh["B3"] = n_individuals
-        sh["D3"] = "Unique recordings"
-        sh["E3"] = n_recordings
-        for cell in ["A3", "D3"]:
-            sh[cell].font = Font(bold=True, color="1F4E78")
-            sh[cell].fill = PatternFill("solid", fgColor="D9EAF7")
-            sh[cell].alignment = Alignment(horizontal="center")
-            sh[cell].border = Border(bottom=thin)
-        for cell in ["B3", "E3"]:
-            sh[cell].font = Font(bold=True, size=12)
-            sh[cell].fill = PatternFill("solid", fgColor="E2F0D9")
-            sh[cell].alignment = Alignment(horizontal="center")
-            sh[cell].border = Border(bottom=thin)
-
-        sh["A4"] = "Individual names are shown once, followed by the recordings assigned to this split."
-        sh["A4"].font = Font(italic=True, color="666666")
-        sh.merge_cells("A4:F4")
-
         headers = ["individual / recording", "label_name", "image_name", "sample_dir", "hypergui_dir", "spectrum_xlsx_path"]
-        header_row = 6
         for col, header in enumerate(headers, 1):
-            c = sh.cell(header_row, col, header)
+            c = sh.cell(3, col, header)
             c.font = Font(bold=True)
             c.fill = fill_header
             c.border = Border(bottom=thin)
             c.alignment = Alignment(horizontal="center")
-
-        row_i = header_row + 1
+        row_i = 4
         if d is not None and not d.empty:
             d = d[["individual", "recording", "label_name", "image_name", "sample_dir", "hypergui_dir", "spectrum_xlsx_path"]].sort_values(["individual", "recording", "label_name"])
             for individual, group in d.groupby("individual", sort=True):
-                # Individual row appears once.
                 sh.cell(row_i, 1, str(individual))
-                sh.cell(row_i, 1).font = Font(bold=True, color="1F4E78")
+                sh.cell(row_i, 1).font = Font(bold=True)
                 sh.cell(row_i, 1).fill = fill_individual
                 sh.cell(row_i, 2, f"{group['recording'].nunique()} recordings")
                 sh.cell(row_i, 2).font = Font(italic=True, color="666666")
                 for col in range(1, len(headers) + 1):
                     sh.cell(row_i, col).border = Border(bottom=thin)
                 row_i += 1
-
-                # Recording rows under the individual.
                 for _, rec in group.iterrows():
-                    sh.cell(row_i, 1, "  " + str(rec["recording"]))
+                    sh.cell(row_i, 1, str(rec["recording"]))
                     sh.cell(row_i, 2, str(rec["label_name"]))
                     sh.cell(row_i, 3, str(rec["image_name"]))
                     sh.cell(row_i, 4, str(rec["sample_dir"]))
@@ -325,20 +286,14 @@ def write_clean_excel_report(
                     for col in range(1, len(headers) + 1):
                         sh.cell(row_i, col).border = Border(bottom=hair)
                         sh.cell(row_i, col).alignment = Alignment(wrap_text=False, vertical="top")
-                    sh.cell(row_i, 1).font = Font(color="555555")
                     row_i += 1
-        else:
-            sh.cell(row_i, 1, "No recordings assigned to this split for this class.")
-            sh.cell(row_i, 1).font = Font(italic=True, color="666666")
-
-        sh.freeze_panes = f"A{header_row + 1}"
-        sh.auto_filter.ref = f"A{header_row}:F{max(row_i - 1, header_row)}"
-        widths = {"A": 42, "B": 16, "C": 54, "D": 70, "E": 48, "F": 70}
+        sh.freeze_panes = "A4"
+        sh.auto_filter.ref = f"A3:F{max(row_i - 1, 3)}"
+        widths = {"A": 38, "B": 16, "C": 52, "D": 70, "E": 48, "F": 70}
         for col, width in widths.items():
             sh.column_dimensions[col].width = width
-        for row in range(header_row + 1, sh.max_row + 1):
+        for row in range(4, sh.max_row + 1):
             sh.row_dimensions[row].height = 15
-
 
     # Workbook 1: summary overview.
     wb_summary = Workbook()
